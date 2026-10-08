@@ -1377,13 +1377,32 @@ opt_shared_file_list_repair() {
         return 0
     fi
     local scan_rc=0
+    local scan_err_file=""
+    scan_err_file=$(mktemp_file "optimize-shared-file-lists-errors" 2> /dev/null) || scan_err_file=""
     run_with_timeout "$MOLE_TIMEOUT_MEDIUM_PROBE_SEC" find "$sfl_dir" \
         \( -name "*.sfl2" -o -name "*.sfl3" \) -type f \
         ! -path "*ApplicationRecentDocuments*" -print0 \
-        > "$scan_file" 2> /dev/null || scan_rc=$?
+        > "$scan_file" 2> "${scan_err_file:-/dev/null}" || scan_rc=$?
     if [[ $scan_rc -ne 0 ]]; then
         : > "$scan_file" || true
         mole_rc_timeout_or_signal "$scan_rc" && return "$scan_rc"
+        # A privacy-protected path (no Full Disk Access) is out of reach, not a
+        # failed scan: publishing FAILED every run blamed the machine for a
+        # grant the caller never had. Mirrors bin/installer.sh, which already
+        # treats permission-only scan errors as non-fatal.
+        local permission_only=false
+        if [[ -n "$scan_err_file" && -s "$scan_err_file" ]]; then
+            if ! grep -Ev \
+                -e '(Permission denied|Operation not permitted)( \(os error [0-9]+\))?\.?$' \
+                -e '^$' "$scan_err_file" > /dev/null; then
+                permission_only=true
+            fi
+        fi
+        if [[ "$permission_only" == "true" ]]; then
+            echo -e "  ${GRAY}-${NC} Shared file lists not readable (grant Full Disk Access to inspect)"
+            optimize_task_result "$MOLE_OPTIMIZE_OUTCOME_UNAVAILABLE"
+            return 0
+        fi
         echo -e "  ${YELLOW}${ICON_WARNING}${NC} Failed to scan shared file lists"
         scan_failed=1
     fi
@@ -1967,6 +1986,8 @@ opt_login_items_audit() {
     if [[ $snapshot_status -ne 0 ]]; then
         if mole_rc_timeout "$snapshot_status"; then
             echo -e "  ${YELLOW}${ICON_WARNING}${NC} Failed to inspect login items (snapshot timed out)"
+            optimize_task_result "$MOLE_OPTIMIZE_OUTCOME_UNAVAILABLE"
+            return 0
         elif [[ $snapshot_status -ge 128 ]]; then
             echo -e "  ${YELLOW}${ICON_WARNING}${NC} Failed to inspect login items (snapshot interrupted)"
         else
@@ -2016,6 +2037,8 @@ opt_login_items_audit() {
         if [[ $inventory_status -ne 0 ]]; then
             if mole_rc_timeout "$inventory_status"; then
                 echo -e "  ${YELLOW}${ICON_WARNING}${NC} Login items audit incomplete (app inventory timed out; no conclusions published)"
+                optimize_task_result "$MOLE_OPTIMIZE_OUTCOME_UNAVAILABLE"
+                return 0
             elif [[ $inventory_status -ge 128 ]]; then
                 echo -e "  ${YELLOW}${ICON_WARNING}${NC} Login items audit incomplete (app inventory interrupted; no conclusions published)"
             else
@@ -2055,6 +2078,11 @@ opt_login_items_audit() {
     if [[ $audit_status -ne 0 ]]; then
         if mole_rc_timeout "$audit_status"; then
             echo -e "  ${YELLOW}${ICON_WARNING}${NC} Login items audit incomplete (time limit reached; no conclusions published)"
+            # A time ceiling is not a failed operation: the audit published no
+            # conclusions either way. Reporting FAILED here turned one slow or
+            # broken login item into a machine-wide failure badge on every run.
+            optimize_task_result "$MOLE_OPTIMIZE_OUTCOME_UNAVAILABLE"
+            return 0
         elif [[ $audit_status -ge 128 ]]; then
             echo -e "  ${YELLOW}${ICON_WARNING}${NC} Login items audit incomplete (probe interrupted; no conclusions published)"
         else
