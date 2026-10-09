@@ -11,7 +11,7 @@ setup_file() {
 
 teardown_file() {
 	if [[ "$TEST_HOME" == "${BATS_TEST_DIRNAME}/tmp-optimize-unavailable."* ]]; then
-		rm -rf "$TEST_HOME"
+		rm -rf "$TEST_HOME" # SAFE: Only this file's private test HOME is removed.
 	fi
 }
 
@@ -37,7 +37,7 @@ execute_optimization shared_file_list_repair
 EOF
 
 	[[ "$status" -eq 0 ]] || { echo "$output"; return 1; }
-	[[ "$output" == *"Shared file lists not readable"* ]] || return 1
+	[[ "$output" == *"Shared file lists not readable (check directory permissions and Full Disk Access)"* ]] || return 1
 	[[ "$output" != *"Failed to scan shared file lists"* ]] || return 1
 }
 
@@ -82,5 +82,108 @@ execute_optimization login_items_audit
 EOF
 
 	[[ "$status" -eq 0 ]] || { echo "$output"; return 1; }
-	[[ "$output" == *"snapshot timed out"* ]] || return 1
+	[[ "$output" == *"Login items unavailable (snapshot timed out)"* ]] || return 1
+	[[ "$output" != *"Failed to inspect login items"* ]] || return 1
+}
+
+@test "shared file list scan keeps mixed errors and classifier failures failed" {
+	for scenario in mixed classifier blank; do
+		run env HOME="$TEST_HOME/shared-$scenario" SCENARIO="$scenario" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'SH'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+mkdir -p "$HOME/Library/Application Support/com.apple.sharedfilelist"
+candidate="$HOME/Library/Application Support/com.apple.sharedfilelist/fixture.sfl3"
+printf 'corrupt fixture\n' > "$candidate"
+plutil() { return 1; }
+run_with_timeout() {
+    printf '%s\0' "$candidate"
+    if [[ "$SCENARIO" == blank ]]; then
+        printf '\n' >&2
+    else
+        printf 'find: fixture: Permission denied\n' >&2
+        [[ "$SCENARIO" != mixed ]] || printf 'find: fixture: Input/output error\n' >&2
+    fi
+    return 1
+}
+if [[ "$SCENARIO" == classifier ]]; then
+    grep() { printf 'classifier-called\n' >> "$HOME/trace"; return 2; }
+fi
+safe_remove() { printf '%s\n' "$1" >> "$HOME/removal.trace"; }
+execute_optimization shared_file_list_repair
+[[ "$(optimize_outcome_count failed)" == 1 ]] || exit 1
+[[ "$(optimize_outcome_count unavailable)" == 0 ]] || exit 1
+[[ ! -e "$HOME/removal.trace" ]] || exit 1
+if [[ "$SCENARIO" == classifier ]]; then
+    [[ -s "$HOME/trace" ]] || exit 1
+fi
+# The same eligible corrupt file reaches the mocked sink after a complete scan.
+optimize_outcomes_reset
+run_with_timeout() { printf '%s\0' "$candidate"; }
+execute_optimization shared_file_list_repair
+[[ "$(cat "$HOME/removal.trace")" == "$candidate" ]] || exit 1
+[[ "$(optimize_outcome_count applied)" == 1 ]] || exit 1
+SH
+		[[ "$status" -eq 0 ]] || { echo "$scenario: $output"; return 1; }
+		[[ "$output" == *"Failed to scan shared file lists"* ]] || return 1
+	done
+}
+
+@test "login items audit reports unavailable when app inventory times out" {
+	run env HOME="$TEST_HOME/login-inventory-timeout" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'SH'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+unset MOLE_TEST_NO_AUTH
+_login_items_snapshot() { printf 'Stale Entry\tmissing value\n'; }
+_login_item_build_app_inventory() { return 124; }
+_login_item_app_exists() { printf 'owner probe\n' >> "$HOME/probes"; return 0; }
+execute_optimization login_items_audit
+[[ "$(optimize_outcome_count failed)" == 0 ]] || exit 1
+[[ "$(optimize_outcome_count unavailable)" == 1 ]] || exit 1
+[[ ! -e "$HOME/probes" ]] || exit 1
+optimize_outcomes_reset
+_login_item_build_app_inventory() { : > "$1"; }
+execute_optimization login_items_audit
+[[ "$(cat "$HOME/probes")" == 'owner probe' ]] || exit 1
+SH
+	[[ "$status" -eq 0 ]] || { echo "$output"; return 1; }
+	[[ "$output" == *"app inventory timed out"* ]] || return 1
+}
+
+@test "login items audit propagates signals from every inspection stage" {
+	for stage in snapshot inventory probe; do
+		run env HOME="$TEST_HOME/login-signal-$stage" STAGE="$stage" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'SH'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+unset MOLE_TEST_NO_AUTH
+_login_items_snapshot() {
+    [[ "$STAGE" != snapshot ]] || return 130
+    printf 'Stale Entry\tmissing value\nNext Entry\tmissing value\n'
+}
+_login_item_build_app_inventory() {
+    [[ "$STAGE" != inventory ]] || return 130
+    :
+}
+_login_item_app_exists() {
+    printf '%s\n' "$1" >> "$HOME/probes"
+    [[ "$1" != 'Stale Entry' ]] || return 130
+    return 0
+}
+mkdir -p "$HOME"
+optimize_task_start
+rc=0
+opt_login_items_audit || rc=$?
+[[ "$rc" -eq 130 ]] || exit 1
+[[ "$MOLE_OPTIMIZE_TASK_OUTCOME" == failed ]] || exit 1
+if [[ "$STAGE" == probe ]]; then
+    [[ "$(cat "$HOME/probes")" == 'Stale Entry' ]] || exit 1
+else
+    [[ ! -e "$HOME/probes" ]] || exit 1
+fi
+SH
+		[[ "$status" -eq 0 ]] || { echo "$stage: $output"; return 1; }
+		[[ "$output" == *"interrupted"* ]] || return 1
+	done
 }
